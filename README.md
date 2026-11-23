@@ -6,6 +6,24 @@
 
 ---
 
+## UI 预览
+
+<p>
+  <img width="420" alt="左下角配额进度条" src="https://github.com/user-attachments/assets/e97ec56c-cbee-4b20-8270-b34902c88627" />
+  <img width="420" alt="左下角并列双圆环" src="https://github.com/user-attachments/assets/4f1b717a-514d-4c0f-8f7f-6f5a01086c65" />
+</p>
+
+<p>
+  <img width="848" alt="顶部标题栏独立配额池胶囊" src="https://github.com/user-attachments/assets/9a81c480-bf65-4fd9-9b94-b7fac0b8f17a" />
+</p>
+
+<p>
+  <img width="320" alt="配额详情浮窗" src="https://github.com/user-attachments/assets/43068a07-cc9e-4fcb-a7d0-9de2f7ba46b0" />
+  <img width="520" alt="系统设置外观卡片开关" src="https://github.com/user-attachments/assets/30bde481-e353-43ce-b04c-6f82b97dbb96" />
+</p>
+
+---
+
 ## 已内置模块
 
 ### 1. 常驻模型配额监控（`quota-bar`）
