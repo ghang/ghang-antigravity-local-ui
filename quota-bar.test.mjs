@@ -45,7 +45,8 @@ function loadLogicHelpers() {
       maskEmail,
       normalizeAccountInfo,
       normalizeGroupsForCache,
-      detectTurnFinishedSignal
+      detectTurnFinishedSignal,
+      resolveCompactRingModel
     };`,
   );
   return factory();
@@ -467,4 +468,83 @@ test('install.mjs idempotently installs, preserves existing user code, reports s
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('compact style: normalization preserves default bar, supports compact, and ring button triggers direct refresh', () => {
+  const h = loadLogicHelpers();
+  assert.equal(h.normalizeQuotaBarStyleValue(undefined), 'bar');
+  assert.equal(h.normalizeQuotaBarStyleValue('bar'), 'bar');
+  assert.equal(h.normalizeQuotaBarStyleValue('ring'), 'ring');
+  assert.equal(h.normalizeQuotaBarStyleValue('圆环'), 'ring');
+  assert.equal(h.normalizeQuotaBarStyleValue('compact'), 'compact');
+  assert.equal(h.normalizeQuotaBarStyleValue('极简'), 'compact');
+  assert.equal(h.normalizeQuotaBarStyleValue('codex'), 'compact');
+
+  const css = readFileSync(CSS_PATH, 'utf8');
+  for (const needle of [
+    '--ag-qb-compact-outer-ok',
+    '--ag-qb-compact-inner-ok',
+    '--ag-qb-compact-warn',
+    '--ag-qb-compact-crit',
+    '.ag-qb-compact-ring-svg',
+    '[data-style="compact"]',
+    '.ag-qb-compact-ring-btn',
+    'var(--ag-sidebar-row-fg, var(--ag-qb-text))',
+  ]) {
+    assert.ok(css.includes(needle), `Expected compact CSS token/selector: ${needle}`);
+  }
+
+  const js = readFileSync(JS_PATH, 'utf8');
+  assert.match(js, /styleCompact:\s*'极简'/);
+  assert.match(js, /data-ring-slot/);
+  assert.match(js, /ag-qb-compact-ring-btn/);
+
+  // Dual buckets (e.g. Pro/Plus with both 5h & weekly) -> dual concentric rings
+  const dual = h.resolveCompactRingModel(
+    {
+      buckets: [
+        { window: 'weekly', remainingFraction: 0.98 },
+        { window: '5h', remainingFraction: 0.92 },
+      ],
+    },
+    true,
+  );
+  assert.equal(dual.mode, 'dual');
+  assert.equal(dual.outerPct, 92);
+  assert.equal(dual.innerPct, 98);
+  assert.deepEqual(dual.segments, [
+    { key: '5h', pct: 92 },
+    { key: '7d', pct: 98 },
+  ]);
+
+  // Weekly-only plan (e.g. Ultra without 5h bucket) -> clean single ring
+  const weeklyOnly = h.resolveCompactRingModel(
+    {
+      buckets: [{ window: 'weekly', remainingFraction: 0.87 }],
+    },
+    true,
+  );
+  assert.equal(weeklyOnly.mode, 'single');
+  assert.equal(weeklyOnly.outerPct, 87);
+  assert.equal(weeklyOnly.innerPct, null);
+  assert.deepEqual(weeklyOnly.segments, [{ key: '7d', pct: 87 }]);
+
+  // 5h-only plan -> clean single ring
+  const fiveOnly = h.resolveCompactRingModel(
+    {
+      buckets: [{ window: '5h', remainingFraction: 0.64 }],
+    },
+    false,
+  );
+  assert.equal(fiveOnly.mode, 'single');
+  assert.equal(fiveOnly.outerPct, 64);
+  assert.equal(fiveOnly.innerPct, null);
+  assert.deepEqual(fiveOnly.segments, [{ key: '5h', pct: 64 }]);
+
+  // Empty -> empty mode
+  const empty = h.resolveCompactRingModel(null, true);
+  assert.equal(empty.mode, 'empty');
+  assert.equal(empty.outerPct, null);
+  assert.equal(empty.innerPct, null);
+  assert.deepEqual(empty.segments, []);
 });
