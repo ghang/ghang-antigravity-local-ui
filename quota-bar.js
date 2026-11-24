@@ -39,7 +39,9 @@
   /* QUOTA_BAR_LOGIC_START */
   function normalizeQuotaBarStyleValue(rawVal) {
     const s = String(rawVal || '').trim().toLowerCase();
-    return s === 'ring' || s === '圆环' ? 'ring' : 'bar';
+    if (s === 'compact' || s === '极简' || s === '極簡' || s === 'コンパクト' || s === 'codex') return 'compact';
+    if (s === 'ring' || s === '圆环') return 'ring';
+    return 'bar';
   }
 
   function normalizeQuotaBarClickValue(rawVal) {
@@ -431,6 +433,55 @@
       }
     };
   }
+
+  function resolveCompactRingModel(globalGroup, isZh = true) {
+    const weekBucket = getBucketByWindow(globalGroup, 'weekly');
+    const fiveBucket = getBucketByWindow(globalGroup, '5h');
+    const remWeekly = weekBucket ? calcRemainingPct(weekBucket.remainingFraction, false) : null;
+    const rem5h = fiveBucket ? calcRemainingPct(fiveBucket.remainingFraction, false) : null;
+
+    if (rem5h !== null && remWeekly !== null) {
+      return {
+        mode: 'dual',
+        outerPct: rem5h,
+        innerPct: remWeekly,
+        segments: [
+          { key: '5h', pct: rem5h },
+          { key: '7d', pct: remWeekly }
+        ]
+      };
+    }
+    if (remWeekly !== null) {
+      return {
+        mode: 'single',
+        outerPct: remWeekly,
+        innerPct: null,
+        segments: [{ key: '7d', pct: remWeekly }]
+      };
+    }
+    if (rem5h !== null) {
+      return {
+        mode: 'single',
+        outerPct: rem5h,
+        innerPct: null,
+        segments: [{ key: '5h', pct: rem5h }]
+      };
+    }
+    const buckets = Array.isArray(globalGroup?.buckets) ? globalGroup.buckets : [];
+    for (let i = 0; i < buckets.length; i++) {
+      const b = buckets[i];
+      const pct = calcRemainingPct(b?.remainingFraction, false);
+      if (pct !== null) {
+        return {
+          mode: 'single',
+          outerPct: pct,
+          innerPct: null,
+          segments: [{ key: b.displayName || (isZh ? '配额' : 'Quota'), pct }]
+        };
+      }
+    }
+    return { mode: 'empty', outerPct: null, innerPct: null, segments: [] };
+  }
   /* QUOTA_BAR_LOGIC_END */
 
   const SETTINGS_UI_STRINGS = {
@@ -441,8 +492,10 @@
       reset5hDesc: '不勾选时仅显示周限额倒计时，5h 剩余 ≤25% 时自动切换',
       styleBar: '进度条',
       styleRing: '圆环',
+      styleCompact: '极简',
       styleBarTip: '双圆角进度条（窄边栏自动缩为双圆环）',
       styleRingTip: '左右并列双圆环配额指示器',
+      styleCompactTip: '极简单行同心双环（与系统设置齐平，点小圆环直刷，悬停查看各池详情）',
       clickPopover: '详情卡',
       clickRefresh: '刷新',
       clickSettings: '设置',
@@ -457,8 +510,10 @@
       reset5hDesc: 'オフ時は週間リセットのみ表示（5時間残量 ≤25% で自動切替）',
       styleBar: 'バー',
       styleRing: 'リング',
+      styleCompact: 'コンパクト',
       styleBarTip: 'デュアル角丸バー（狭いサイドバーはリングに自動切替）',
       styleRingTip: '左右並びリングインジケーター',
+      styleCompactTip: '1行のコンパクトなデュアルリング（リングクリックで即更新・ホバーで詳細表示）',
       clickPopover: '詳細',
       clickRefresh: '更新',
       clickSettings: '設定',
@@ -473,8 +528,10 @@
       reset5hDesc: 'When off, shows weekly reset only; auto-switches to 5h when ≤25% left',
       styleBar: 'Bar',
       styleRing: 'Ring',
+      styleCompact: 'Compact',
       styleBarTip: 'Dual rounded bars (auto dual-ring when narrow)',
       styleRingTip: 'Side-by-side dual-ring indicator',
+      styleCompactTip: 'Minimal single-row dual ring (click ring to refresh, hover for all pools)',
       clickPopover: 'Details',
       clickRefresh: 'Refresh',
       clickSettings: 'Settings',
@@ -633,16 +690,17 @@
     return isZh ? `${hours}小时前更新` : `Updated ${hours}h ago`;
   }
 
-  function buildRingSvg(outerPct, innerPct, sizePx = 16) {
+  function buildRingSvg(outerPct, innerPct, sizePx = 16, opts = null) {
     const SVG_NS = 'http://www.w3.org/2000/svg';
+    const compactPalette = Boolean(opts?.compactPalette);
     const svg = document.createElementNS(SVG_NS, 'svg');
-    svg.setAttribute('class', 'ag-qb-ring-svg');
+    svg.setAttribute('class', compactPalette ? 'ag-qb-ring-svg ag-qb-compact-ring-svg' : 'ag-qb-ring-svg');
     svg.setAttribute('viewBox', '0 0 16 16');
     svg.setAttribute('width', String(sizePx));
     svg.setAttribute('height', String(sizePx));
     svg.setAttribute('aria-hidden', 'true');
 
-    const addRing = (radius, strokeWidth, pct) => {
+    const addRing = (radius, strokeWidth, pct, slot) => {
       const track = document.createElementNS(SVG_NS, 'circle');
       track.setAttribute('class', 'ag-qb-ring-track');
       track.setAttribute('cx', '8');
@@ -657,6 +715,7 @@
         const arc = document.createElementNS(SVG_NS, 'circle');
         arc.setAttribute('class', 'ag-qb-ring-arc');
         arc.setAttribute('data-level', levelOfRemaining(pct));
+        if (slot) arc.setAttribute('data-ring-slot', slot);
         arc.setAttribute('cx', '8');
         arc.setAttribute('cy', '8');
         arc.setAttribute('r', String(radius));
@@ -668,11 +727,21 @@
       }
     };
 
-    if (innerPct === null || innerPct === undefined) {
-      addRing(5.8, 2.2, outerPct);
+    let effOuter = outerPct;
+    let effInner = innerPct;
+    if ((effOuter === null || effOuter === undefined) && effInner !== null && effInner !== undefined) {
+      effOuter = effInner;
+      effInner = null;
+    }
+
+    if (effInner === null || effInner === undefined) {
+      addRing(compactPalette ? 5.9 : 5.8, compactPalette ? 1.95 : 2.2, effOuter, 'outer');
+    } else if (compactPalette) {
+      addRing(6.3, 1.85, effOuter, 'outer');
+      addRing(3.5, 1.7, effInner, 'inner');
     } else {
-      addRing(6.2, 2.0, outerPct);
-      addRing(3.5, 1.9, innerPct);
+      addRing(6.2, 2.0, effOuter, 'outer');
+      addRing(3.5, 1.9, effInner, 'inner');
     }
     return svg;
   }
@@ -1174,8 +1243,10 @@
           const v = b.getAttribute('data-ag-qb-opt-btn');
           const on = v === curStyle;
           if (b.getAttribute('aria-pressed') !== String(on)) b.setAttribute('aria-pressed', String(on));
-          const wantText = v === 'ring' ? qbStrings.styleRing : qbStrings.styleBar;
-          const wantTip = v === 'ring' ? qbStrings.styleRingTip : qbStrings.styleBarTip;
+          const wantText =
+            v === 'compact' ? qbStrings.styleCompact : v === 'ring' ? qbStrings.styleRing : qbStrings.styleBar;
+          const wantTip =
+            v === 'compact' ? qbStrings.styleCompactTip : v === 'ring' ? qbStrings.styleRingTip : qbStrings.styleBarTip;
           if (b.textContent !== wantText) b.textContent = wantText;
           if (b.getAttribute('aria-label') !== wantTip) b.setAttribute('aria-label', wantTip);
         }
@@ -1319,6 +1390,11 @@
             val: 'ring',
             getLabel: () => getQbStrings().styleRing,
             getTip: () => getQbStrings().styleRingTip
+          },
+          {
+            val: 'compact',
+            getLabel: () => getQbStrings().styleCompact,
+            getTip: () => getQbStrings().styleCompactTip
           }
         ],
         (val) => {
@@ -1546,15 +1622,23 @@
   function bindTriggerInteraction(el, anchorKind) {
     if (el.__ag_qb_bound) return;
     el.__ag_qb_bound = true;
-    el.addEventListener('click', (ev) => handleTriggerClick(el, anchorKind, ev));
+    el.addEventListener('click', (ev) => {
+      if (ev?.target instanceof Element && ev.target.closest('.ag-qb-compact-ring-btn')) return;
+      handleTriggerClick(el, anchorKind, ev);
+    });
     el.addEventListener('keydown', (ev) => {
+      if (ev?.target instanceof Element && ev.target.closest('.ag-qb-compact-ring-btn')) return;
       if (ev.key === 'Enter' || ev.key === ' ') {
         handleTriggerClick(el, anchorKind, ev);
       }
     });
     el.addEventListener('mouseenter', () => {
+      if (tooltipOpen && tooltipPinned && tooltipAnchorKind === anchorKind) {
+        cancelHoverClose();
+        return;
+      }
       const clickMode = getClickPref();
-      if (clickMode === 'refresh' || clickMode === 'settings') {
+      if (clickMode === 'refresh' || clickMode === 'settings' || (anchorKind === 'sidebar' && getStylePref() === 'compact')) {
         openTooltip(el, anchorKind, false);
       }
     });
@@ -1626,6 +1710,60 @@
     return { wrap, btn };
   }
 
+  function resetSidebarBtnInlineStyle(btn) {
+    if (!btn?.style) return;
+    btn.style.height = '';
+    btn.style.paddingLeft = '';
+    btn.style.paddingRight = '';
+    btn.style.gap = '';
+    btn.style.borderRadius = '';
+    btn.style.fontSize = '';
+    btn.style.fontWeight = '';
+    btn.style.color = '';
+  }
+
+  function syncCompactRowGeometry(btn) {
+    let iconSize = 16;
+    const settingsBtn = document.querySelector('[data-testid="settings-button"]');
+    if (!settingsBtn || typeof window.getComputedStyle !== 'function') return iconSize;
+    try {
+      const cs = window.getComputedStyle(settingsBtn);
+      const sRect = settingsBtn.getBoundingClientRect();
+      const iconEl = settingsBtn.querySelector('svg');
+      const iconRect = iconEl ? iconEl.getBoundingClientRect() : null;
+      const textEl =
+        Array.from(settingsBtn.querySelectorAll('span')).find((el) => (el.textContent || '').trim().length > 0) ||
+        settingsBtn;
+      const tcs = window.getComputedStyle(textEl);
+
+      if (sRect && sRect.height >= 22 && sRect.height <= 44) {
+        btn.style.height = `${Math.round(sRect.height)}px`;
+      }
+      if (cs.paddingLeft) btn.style.paddingLeft = cs.paddingLeft;
+      if (cs.paddingRight) btn.style.paddingRight = cs.paddingRight;
+      if (cs.borderRadius) btn.style.borderRadius = cs.borderRadius;
+      if (tcs.fontSize) {
+        const basePx = parseFloat(tcs.fontSize);
+        btn.style.fontSize = Number.isFinite(basePx)
+          ? `${Math.max(12, Math.min(14, Math.round(basePx - 1)))}px`
+          : tcs.fontSize;
+      }
+      if (tcs.fontWeight) btn.style.fontWeight = tcs.fontWeight;
+      btn.style.color = '';
+
+      if (iconRect && iconRect.width >= 12 && iconRect.width <= 22) {
+        iconSize = Math.max(15, Math.min(18, Math.round(iconRect.width)));
+      }
+      const textRect = textEl && textEl !== settingsBtn ? textEl.getBoundingClientRect() : null;
+      if (iconRect && textRect && textRect.left > iconRect.right) {
+        btn.style.gap = `${Math.max(4, Math.min(16, Math.round(textRect.left - iconRect.right)))}px`;
+      } else if (cs.columnGap || cs.gap) {
+        btn.style.gap = cs.columnGap || cs.gap;
+      }
+    } catch (e) {}
+    return iconSize;
+  }
+
   function renderSidebarWidget() {
     const refs = ensureSidebarWrap();
     if (!refs) return;
@@ -1633,6 +1771,7 @@
     const isZh = isZhLang();
     const stylePref = getStylePref();
     const clickPref = getClickPref();
+    wrap.setAttribute('data-style-mode', stylePref);
     btn.setAttribute('data-style', stylePref);
     if (isFetching) btn.setAttribute('data-loading', '1');
     else btn.removeAttribute('data-loading');
@@ -1665,13 +1804,83 @@
       btn.removeAttribute('title');
     }
 
+    const compactModel = resolveCompactRingModel(globalGroup, isZh);
+
     btn.replaceChildren();
     if (sidebarCompact) {
+      resetSidebarBtnInlineStyle(btn);
       wrap.setAttribute('data-compact', '1');
-      btn.appendChild(buildRingSvg(rem5h, remWeekly, 16));
+      btn.appendChild(
+        buildRingSvg(compactModel.outerPct, compactModel.innerPct, 16, { compactPalette: stylePref === 'compact' })
+      );
       return;
     }
     wrap.removeAttribute('data-compact');
+
+    if (stylePref === 'compact') {
+      const iconSize = syncCompactRowGeometry(btn);
+      const ringBtn = document.createElement('button');
+      ringBtn.type = 'button';
+      ringBtn.className = isFetching ? 'ag-qb-compact-ring-btn ag-qb-spinning' : 'ag-qb-compact-ring-btn';
+      const ringTip = isZh ? '点击刷新模型配额' : 'Click to refresh quotas';
+      ringBtn.setAttribute('aria-label', ringTip);
+      ringBtn.title = ringTip;
+      ringBtn.style.width = `${iconSize}px`;
+      ringBtn.style.height = `${iconSize}px`;
+      ringBtn.appendChild(
+        buildRingSvg(compactModel.outerPct, compactModel.innerPct, iconSize, { compactPalette: true })
+      );
+      ringBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        void fetchQuota(true);
+      });
+
+      const textSpan = document.createElement('span');
+      textSpan.className = 'ag-qb-compact-text';
+      if (compactModel.segments.length === 0) {
+        const statusEl = document.createElement('span');
+        statusEl.className = 'ag-qb-compact-val';
+        statusEl.setAttribute('data-level', 'muted');
+        statusEl.textContent = isFetching
+          ? isZh
+            ? '配额同步中…'
+            : 'Syncing quota…'
+          : isZh
+            ? '配额待同步'
+            : 'Quota pending';
+        textSpan.appendChild(statusEl);
+      } else {
+        for (let i = 0; i < compactModel.segments.length; i++) {
+          const item = compactModel.segments[i];
+          if (i > 0) {
+            const sep = document.createElement('span');
+            sep.className = 'ag-qb-compact-sep';
+            sep.setAttribute('aria-hidden', 'true');
+            sep.textContent = '·';
+            textSpan.appendChild(sep);
+          }
+          const seg = document.createElement('span');
+          seg.className = 'ag-qb-compact-seg';
+          const kEl = document.createElement('span');
+          kEl.className = 'ag-qb-compact-k';
+          kEl.textContent = item.key;
+          const vEl = document.createElement('span');
+          vEl.className = 'ag-qb-compact-val';
+          vEl.setAttribute('data-level', levelOfRemaining(item.pct));
+          vEl.textContent = item.pct === null ? '--' : `${item.pct}%`;
+          seg.appendChild(kEl);
+          seg.appendChild(vEl);
+          textSpan.appendChild(seg);
+        }
+      }
+
+      btn.appendChild(ringBtn);
+      btn.appendChild(textSpan);
+      return;
+    }
+
+    resetSidebarBtnInlineStyle(btn);
 
     const appendResetLine = () => {
       const statusInfo = formatSidebarResetStatus({
@@ -1871,12 +2080,13 @@
     nameEl.textContent = poolName;
     pill.appendChild(nameEl);
 
-    if (stylePref === 'ring') {
+    if (stylePref === 'ring' || stylePref === 'compact') {
+      const useCompactPalette = stylePref === 'compact';
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
         const itemEl = document.createElement('span');
         itemEl.className = 'ag-qb-pill-item';
-        itemEl.appendChild(buildRingSvg(it.pct, null, 14));
+        itemEl.appendChild(buildRingSvg(it.pct, null, 14, { compactPalette: useCompactPalette }));
         const tagEl = document.createElement('span');
         tagEl.className = 'ag-qb-pill-tag';
         tagEl.textContent = it.key;

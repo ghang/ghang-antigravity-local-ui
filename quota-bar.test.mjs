@@ -45,7 +45,8 @@ function loadLogicHelpers() {
       maskEmail,
       normalizeAccountInfo,
       normalizeGroupsForCache,
-      detectTurnFinishedSignal
+      detectTurnFinishedSignal,
+      resolveCompactRingModel
     };`,
   );
   return factory();
@@ -467,4 +468,370 @@ test('install.mjs idempotently installs, preserves existing user code, reports s
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('compact style: normalization preserves default bar, supports compact, and ring button triggers direct refresh', () => {
+  const h = loadLogicHelpers();
+  assert.equal(h.normalizeQuotaBarStyleValue(undefined), 'bar');
+  assert.equal(h.normalizeQuotaBarStyleValue('bar'), 'bar');
+  assert.equal(h.normalizeQuotaBarStyleValue('ring'), 'ring');
+  assert.equal(h.normalizeQuotaBarStyleValue('圆环'), 'ring');
+  assert.equal(h.normalizeQuotaBarStyleValue('compact'), 'compact');
+  assert.equal(h.normalizeQuotaBarStyleValue('极简'), 'compact');
+  assert.equal(h.normalizeQuotaBarStyleValue('コンパクト'), 'compact');
+  assert.equal(h.normalizeQuotaBarStyleValue('codex'), 'compact');
+
+  const css = readFileSync(CSS_PATH, 'utf8');
+  for (const needle of [
+    '--ag-qb-compact-outer-ok',
+    '--ag-qb-compact-inner-ok',
+    '--ag-qb-compact-warn',
+    '--ag-qb-compact-crit',
+    '.ag-qb-compact-ring-svg',
+    '[data-style="compact"]',
+    '.ag-qb-compact-ring-btn',
+    'var(--ag-sidebar-row-fg, var(--ag-qb-text))',
+  ]) {
+    assert.ok(css.includes(needle), `Expected compact CSS token/selector: ${needle}`);
+  }
+
+  const js = readFileSync(JS_PATH, 'utf8');
+  assert.match(js, /styleCompact:\s*'极简'/);
+  assert.match(js, /data-ring-slot/);
+  assert.match(js, /ag-qb-compact-ring-btn/);
+
+  // Dual buckets (e.g. Pro/Plus with both 5h & weekly) -> dual concentric rings
+  const dual = h.resolveCompactRingModel(
+    {
+      buckets: [
+        { window: 'weekly', remainingFraction: 0.98 },
+        { window: '5h', remainingFraction: 0.92 },
+      ],
+    },
+    true,
+  );
+  assert.equal(dual.mode, 'dual');
+  assert.equal(dual.outerPct, 92);
+  assert.equal(dual.innerPct, 98);
+  assert.deepEqual(dual.segments, [
+    { key: '5h', pct: 92 },
+    { key: '7d', pct: 98 },
+  ]);
+
+  // Weekly-only plan (e.g. Ultra without 5h bucket) -> clean single ring
+  const weeklyOnly = h.resolveCompactRingModel(
+    {
+      buckets: [{ window: 'weekly', remainingFraction: 0.87 }],
+    },
+    true,
+  );
+  assert.equal(weeklyOnly.mode, 'single');
+  assert.equal(weeklyOnly.outerPct, 87);
+  assert.equal(weeklyOnly.innerPct, null);
+  assert.deepEqual(weeklyOnly.segments, [{ key: '7d', pct: 87 }]);
+
+  // 5h-only plan -> clean single ring
+  const fiveOnly = h.resolveCompactRingModel(
+    {
+      buckets: [{ window: '5h', remainingFraction: 0.64 }],
+    },
+    false,
+  );
+  assert.equal(fiveOnly.mode, 'single');
+  assert.equal(fiveOnly.outerPct, 64);
+  assert.equal(fiveOnly.innerPct, null);
+  assert.deepEqual(fiveOnly.segments, [{ key: '5h', pct: 64 }]);
+
+  // Empty -> empty mode
+  const empty = h.resolveCompactRingModel(null, true);
+  assert.equal(empty.mode, 'empty');
+  assert.equal(empty.outerPct, null);
+  assert.equal(empty.innerPct, null);
+  assert.deepEqual(empty.segments, []);
+});
+
+test('compact style behavior: ring click forces direct refresh and mouseenter never unpins pinned tooltip', async () => {
+  const src = readFileSync(JS_PATH, 'utf8');
+  const fetchCalls = [];
+  const storageMap = new Map([
+    ['ag-quota-bar-prefs-v1', JSON.stringify({ style: 'compact', click: 'popover', reset5h: false })],
+  ]);
+  const elementsById = new Map();
+
+  class MockElement {
+    constructor(tag = 'div') {
+      this.tagName = tag.toUpperCase();
+      this.nodeType = 1;
+      this.style = {};
+      this.attrs = new Map();
+      this.children = [];
+      this.parentElement = null;
+      this.className = '';
+      this.textContent = '';
+      this.listeners = new Map();
+      this._id = '';
+    }
+    get id() {
+      return this._id;
+    }
+    set id(v) {
+      if (this._id && elementsById.get(this._id) === this) elementsById.delete(this._id);
+      this._id = String(v || '');
+      if (this._id) elementsById.set(this._id, this);
+    }
+    get firstElementChild() {
+      return this.children[0] || null;
+    }
+    get nextElementSibling() {
+      if (!this.parentElement) return null;
+      const idx = this.parentElement.children.indexOf(this);
+      return idx >= 0 ? this.parentElement.children[idx + 1] || null : null;
+    }
+    setAttribute(k, v) {
+      this.attrs.set(k, String(v));
+    }
+    getAttribute(k) {
+      return this.attrs.has(k) ? this.attrs.get(k) : null;
+    }
+    hasAttribute(k) {
+      return this.attrs.has(k);
+    }
+    removeAttribute(k) {
+      this.attrs.delete(k);
+    }
+    appendChild(c) {
+      if (c.parentElement) {
+        const idx = c.parentElement.children.indexOf(c);
+        if (idx >= 0) c.parentElement.children.splice(idx, 1);
+      }
+      c.parentElement = this;
+      this.children.push(c);
+      return c;
+    }
+    insertBefore(c, ref) {
+      if (c.parentElement) {
+        const oldIdx = c.parentElement.children.indexOf(c);
+        if (oldIdx >= 0) c.parentElement.children.splice(oldIdx, 1);
+      }
+      c.parentElement = this;
+      const refIdx = ref ? this.children.indexOf(ref) : -1;
+      if (refIdx >= 0) this.children.splice(refIdx, 0, c);
+      else this.children.push(c);
+      return c;
+    }
+    replaceChildren() {
+      for (const ch of this.children) ch.parentElement = null;
+      this.children = [];
+    }
+    remove() {
+      if (this.parentElement) {
+        const idx = this.parentElement.children.indexOf(this);
+        if (idx >= 0) this.parentElement.children.splice(idx, 1);
+        this.parentElement = null;
+      }
+      if (this._id && elementsById.get(this._id) === this) elementsById.delete(this._id);
+    }
+    addEventListener(type, fn) {
+      if (!this.listeners.has(type)) this.listeners.set(type, []);
+      this.listeners.get(type).push(fn);
+    }
+    removeEventListener(type, fn) {
+      const arr = this.listeners.get(type);
+      if (!arr) return;
+      const idx = arr.indexOf(fn);
+      if (idx >= 0) arr.splice(idx, 1);
+    }
+    dispatch(type, ev = {}) {
+      const event = {
+        type,
+        target: ev.target || this,
+        defaultPrevented: false,
+        stopped: false,
+        preventDefault() {
+          this.defaultPrevented = true;
+        },
+        stopPropagation() {
+          this.stopped = true;
+        },
+        ...ev,
+      };
+      let cur = this;
+      while (cur && !event.stopped) {
+        for (const fn of cur.listeners.get(type) || []) {
+          fn(event);
+        }
+        cur = type === 'mouseenter' || type === 'mouseleave' ? null : cur.parentElement;
+      }
+      return event;
+    }
+    matchesClass(cls) {
+      return String(this.className || '')
+        .split(/\s+/)
+        .includes(cls);
+    }
+    closest(sel) {
+      const parts = String(sel || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      let cur = this;
+      while (cur) {
+        for (const p of parts) {
+          if (p.startsWith('.') && cur.matchesClass(p.slice(1))) return cur;
+          if (p.startsWith('#') && cur.id === p.slice(1)) return cur;
+        }
+        cur = cur.parentElement;
+      }
+      return null;
+    }
+    querySelector(sel) {
+      for (const ch of this.children) {
+        if (sel.startsWith('.') && ch.matchesClass(sel.slice(1))) return ch;
+        if (sel.startsWith('#') && ch.id === sel.slice(1)) return ch;
+        if (sel === 'svg' && ch.tagName === 'SVG') return ch;
+        const found = ch.querySelector(sel);
+        if (found) return found;
+      }
+      return null;
+    }
+    querySelectorAll(sel) {
+      const out = [];
+      for (const ch of this.children) {
+        if (sel === 'span' && ch.tagName === 'SPAN') out.push(ch);
+        else if (sel.startsWith('.') && ch.matchesClass(sel.slice(1))) out.push(ch);
+        out.push(...ch.querySelectorAll(sel));
+      }
+      return out;
+    }
+    getBoundingClientRect() {
+      return { width: 240, height: 32, left: 8, top: 600, right: 248, bottom: 632 };
+    }
+  }
+
+  const rootEl = new MockElement('div');
+  rootEl.id = 'root';
+  const sidebarParent = new MockElement('div');
+  const settingsBtn = new MockElement('button');
+  settingsBtn.setAttribute('data-testid', 'settings-button');
+  sidebarParent.appendChild(settingsBtn);
+
+  const mockCloudCodeService = {
+    async retrieveUserQuotaSummary(force) {
+      fetchCalls.push(Boolean(force));
+      return {
+        response: {
+          groups: [
+            {
+              displayName: 'Gemini Models',
+              buckets: [
+                { bucketId: 'gemini-weekly', window: 'weekly', remaining: { case: 'remainingFraction', value: 0.97 }, resetTime: { seconds: Math.floor(Date.now() / 1000) + 86400 } },
+                { bucketId: 'gemini-5h', window: '5h', remaining: { case: 'remainingFraction', value: 0.88 }, resetTime: { seconds: Math.floor(Date.now() / 1000) + 3600 } },
+              ],
+            },
+          ],
+        },
+      };
+    },
+  };
+  rootEl['__reactContainer$test'] = {
+    current: {
+      memoizedProps: { value: { core: { cloudCodeService: mockCloudCodeService } } },
+    },
+  };
+
+  const sandbox = {
+    console,
+    Date,
+    Math,
+    JSON,
+    Number,
+    String,
+    Boolean,
+    Array,
+    Object,
+    WeakSet,
+    Map,
+    Set,
+    Element: MockElement,
+    performance: { now: () => Date.now() },
+    setTimeout,
+    clearTimeout,
+    setInterval: () => 1,
+    clearInterval: () => {},
+    document: {
+      hidden: false,
+      visibilityState: 'visible',
+      documentElement: new MockElement('html'),
+      body: new MockElement('body'),
+      getElementById: (id) => elementsById.get(id) || null,
+      querySelector: (sel) => (sel === '[data-testid="settings-button"]' ? settingsBtn : null),
+      querySelectorAll: () => [],
+      createElement: (tag) => new MockElement(tag),
+      createElementNS: (_ns, tag) => new MockElement(tag),
+      addEventListener() {},
+      removeEventListener() {},
+    },
+    window: null,
+  };
+  sandbox.window = {
+    location: { protocol: 'vscode-file:' },
+    innerWidth: 1280,
+    innerHeight: 800,
+    localStorage: {
+      getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
+      setItem: (k, v) => storageMap.set(k, String(v)),
+    },
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  sandbox.window.top = sandbox.window;
+
+  const cleanups = [];
+  const ctx = {
+    config: { enabled: true },
+    modules: { metrics: false, quotaBar: true, tokenAnalytics: true },
+    onCleanup: (fn) => cleanups.push(fn),
+  };
+
+  const compiled = vm.runInNewContext(`(function(ctx, boot) {\n${src}\n})`, sandbox);
+  compiled(ctx, ctx);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(fetchCalls, [false], 'initial fetch should run with force=false');
+
+  const sidebarBtn = elementsById.get('ag-sidebar-quota-btn');
+  assert.ok(sidebarBtn, 'sidebar quota button should be mounted');
+  assert.equal(sidebarBtn.getAttribute('data-style'), 'compact');
+
+  // 1) Clicking the small dual-ring button forces direct refresh without opening tooltip
+  const ringBtn = sidebarBtn.querySelector('.ag-qb-compact-ring-btn');
+  assert.ok(ringBtn, 'compact dual-ring button should exist');
+  ringBtn.dispatch('click');
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(fetchCalls, [false, true], 'clicking compact ring button must call fetchQuota(true)');
+  assert.equal(elementsById.get('ag-quota-tooltip')?.getAttribute('data-open') || null, null, 'ring click must not open tooltip');
+
+  // 2) Hover opens preview (unpinned), click pins, subsequent mouseenter keeps it pinned across mouseleave, second click unpins/closes
+  sidebarBtn.dispatch('mouseenter');
+  const tooltip = elementsById.get('ag-quota-tooltip');
+  assert.equal(tooltip?.getAttribute('data-open'), '1', 'hovering compact row opens preview tooltip');
+  assert.equal(sidebarBtn.getAttribute('aria-expanded'), 'false', 'hover preview must remain unpinned');
+
+  sidebarBtn.dispatch('click');
+  assert.equal(tooltip?.getAttribute('data-open'), '1', 'clicking compact row keeps tooltip open');
+  assert.equal(sidebarBtn.getAttribute('aria-expanded'), 'true', 'clicking compact row pins tooltip');
+
+  // Regression check: moving pointer back over compact row must NOT downgrade pinned state
+  sidebarBtn.dispatch('mouseenter');
+  assert.equal(sidebarBtn.getAttribute('aria-expanded'), 'true', 'mouseenter must preserve pinned state');
+  sidebarBtn.dispatch('mouseleave');
+  await new Promise((r) => setTimeout(r, 220));
+  assert.equal(tooltip?.getAttribute('data-open'), '1', 'pinned tooltip must stay open after mouseleave');
+  assert.equal(sidebarBtn.getAttribute('aria-expanded'), 'true');
+
+  // Clicking again unpins and closes cleanly
+  sidebarBtn.dispatch('click');
+  assert.equal(tooltip?.getAttribute('data-open'), null, 'second click closes pinned tooltip');
+  assert.equal(sidebarBtn.getAttribute('aria-expanded'), 'false');
+
+  for (const c of cleanups) c();
 });
