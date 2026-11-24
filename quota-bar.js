@@ -39,7 +39,7 @@
   /* QUOTA_BAR_LOGIC_START */
   function normalizeQuotaBarStyleValue(rawVal) {
     const s = String(rawVal || '').trim().toLowerCase();
-    if (s === 'compact' || s === '极简' || s === '極簡' || s === 'codex') return 'compact';
+    if (s === 'compact' || s === '极简' || s === '極簡' || s === 'コンパクト' || s === 'codex') return 'compact';
     if (s === 'ring' || s === '圆环') return 'ring';
     return 'bar';
   }
@@ -510,10 +510,10 @@
       reset5hDesc: 'オフ時は週間リセットのみ表示（5時間残量 ≤25% で自動切替）',
       styleBar: 'バー',
       styleRing: 'リング',
-      styleCompact: '極簡',
+      styleCompact: 'コンパクト',
       styleBarTip: 'デュアル角丸バー（狭いサイドバーはリングに自動切替）',
       styleRingTip: '左右並びリングインジケーター',
-      styleCompactTip: '1行の極簡デュアルリング（リングクリックで即更新・ホバーで詳細表示）',
+      styleCompactTip: '1行のコンパクトなデュアルリング（リングクリックで即更新・ホバーで詳細表示）',
       clickPopover: '詳細',
       clickRefresh: '更新',
       clickSettings: '設定',
@@ -1633,6 +1633,10 @@
       }
     });
     el.addEventListener('mouseenter', () => {
+      if (tooltipOpen && tooltipPinned && tooltipAnchorKind === anchorKind) {
+        cancelHoverClose();
+        return;
+      }
       const clickMode = getClickPref();
       if (clickMode === 'refresh' || clickMode === 'settings' || (anchorKind === 'sidebar' && getStylePref() === 'compact')) {
         openTooltip(el, anchorKind, false);
@@ -1752,7 +1756,7 @@
       }
       const textRect = textEl && textEl !== settingsBtn ? textEl.getBoundingClientRect() : null;
       if (iconRect && textRect && textRect.left > iconRect.right) {
-        btn.style.gap = `${Math.max(4, Math.round(textRect.left - iconRect.right))}px`;
+        btn.style.gap = `${Math.max(4, Math.min(16, Math.round(textRect.left - iconRect.right)))}px`;
       } else if (cs.columnGap || cs.gap) {
         btn.style.gap = cs.columnGap || cs.gap;
       }
