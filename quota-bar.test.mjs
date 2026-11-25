@@ -46,7 +46,10 @@ function loadLogicHelpers() {
       normalizeAccountInfo,
       normalizeGroupsForCache,
       detectTurnFinishedSignal,
-      resolveCompactRingModel
+      resolveCompactRingModel,
+      encodePrefsCookieValue,
+      parsePrefsCookieString,
+      mergeStoredPrefs
     };`,
   );
   return factory();
@@ -834,4 +837,213 @@ test('compact style behavior: ring click forces direct refresh and mouseenter ne
   assert.equal(sidebarBtn.getAttribute('aria-expanded'), 'false');
 
   for (const c of cleanups) c();
+});
+
+test('prefs dual-write persistence: cookie helpers and cross-port restart recovery', async () => {
+  const h = loadLogicHelpers();
+
+  const encoded = h.encodePrefsCookieValue({ style: 'compact', click: 'refresh', reset5h: true }, 1764000000);
+  assert.equal(encoded, 'compact|refresh|1|1764000000');
+
+  assert.deepEqual(h.parsePrefsCookieString(`foo=bar; ag_qb_prefs=${encoded}; baz=1`), {
+    style: 'compact',
+    click: 'refresh',
+    reset5h: true,
+    updatedAt: 1764000000,
+  });
+  assert.deepEqual(h.parsePrefsCookieString('ag_qb_prefs=ring|settings|0'), {
+    style: 'ring',
+    click: 'settings',
+    reset5h: false,
+    updatedAt: 0,
+  });
+  assert.equal(h.parsePrefsCookieString('ag_qb_prefs=bad|value'), null);
+  assert.equal(h.parsePrefsCookieString('ag_qb_prefs=bar|popover|yes|123'), null);
+  assert.equal(h.parsePrefsCookieString('ag_qb_prefs=bar|popover|1|abc'), null);
+
+  // Empty localStorage + preserved cookie (restart on new port) -> restores from cookie and backfills localStorage
+  const fromCookie = h.mergeStoredPrefs(
+    null,
+    { style: 'bar', click: 'popover', reset5h: true, updatedAt: 1764000100 },
+    { style: 'bar', click: 'popover', reset5h: false },
+  );
+  assert.equal(fromCookie.source, 'cookie');
+  assert.equal(fromCookie.prefs.reset5h, true);
+  assert.equal(fromCookie.needsLocalBackfill, true);
+  assert.equal(fromCookie.needsCookieBackfill, false);
+
+  // Existing localStorage without cookie -> migrates into cookie
+  const fromLocal = h.mergeStoredPrefs(
+    { style: 'ring', click: 'popover', reset5h: true },
+    null,
+    { style: 'bar', click: 'popover', reset5h: false },
+  );
+  assert.equal(fromLocal.source, 'local');
+  assert.equal(fromLocal.prefs.reset5h, true);
+  assert.equal(fromLocal.needsCookieBackfill, true);
+  assert.equal(fromLocal.needsLocalBackfill, false);
+
+  // Ephemeral port reuse with stale localStorage + newer cookie -> cookie wins
+  const newerCookie = h.mergeStoredPrefs(
+    { style: 'bar', click: 'popover', reset5h: false, updatedAt: 1764000050 },
+    { style: 'compact', click: 'refresh', reset5h: true, updatedAt: 1764000200 },
+    { style: 'bar', click: 'popover', reset5h: false },
+  );
+  assert.equal(newerCookie.source, 'cookie');
+  assert.deepEqual(newerCookie.prefs, { style: 'compact', click: 'refresh', reset5h: true });
+  assert.equal(newerCookie.needsLocalBackfill, true);
+
+  // End-to-end VM simulation across two ephemeral ports sharing host cookie jar
+  const src = readFileSync(JS_PATH, 'utf8');
+  const cookieJar = new Map();
+  const writtenCookies = [];
+
+  function makeCookieAccessor() {
+    return {
+      get() {
+        return Array.from(cookieJar.entries())
+          .map(([k, v]) => `${k}=${v}`)
+          .join('; ');
+      },
+      set(raw) {
+        writtenCookies.push(String(raw));
+        const first = String(raw || '').split(';')[0] || '';
+        const eq = first.indexOf('=');
+        if (eq > 0) {
+          cookieJar.set(first.slice(0, eq).trim(), first.slice(eq + 1).trim());
+        }
+      },
+    };
+  }
+
+  function bootOnPort(port, storageMap) {
+    const cleanups = [];
+    const makeEl = (tag = 'div') => ({
+      tagName: tag.toUpperCase(),
+      nodeType: 1,
+      style: {},
+      attrs: new Map(),
+      children: [],
+      className: '',
+      textContent: '',
+      setAttribute(k, v) {
+        this.attrs.set(k, String(v));
+      },
+      getAttribute(k) {
+        return this.attrs.has(k) ? this.attrs.get(k) : null;
+      },
+      hasAttribute(k) {
+        return this.attrs.has(k);
+      },
+      removeAttribute(k) {
+        this.attrs.delete(k);
+      },
+      appendChild(c) {
+        c.parentElement = this;
+        this.children.push(c);
+        return c;
+      },
+      insertBefore(c) {
+        c.parentElement = this;
+        this.children.push(c);
+        return c;
+      },
+      replaceChildren() {
+        this.children = [];
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector() {
+        return null;
+      },
+      querySelectorAll() {
+        return [];
+      },
+      closest() {
+        return null;
+      },
+      getBoundingClientRect() {
+        return { width: 200, height: 30, left: 0, top: 0, right: 200, bottom: 30 };
+      },
+      remove() {},
+    });
+    const doc = {
+      hidden: false,
+      visibilityState: 'visible',
+      documentElement: makeEl('html'),
+      body: makeEl('body'),
+      getElementById: () => null,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      createElement: makeEl,
+      createElementNS: (_ns, tag) => makeEl(tag),
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    Object.defineProperty(doc, 'cookie', makeCookieAccessor());
+
+    const sandbox = {
+      console,
+      Date,
+      Math,
+      JSON,
+      Number,
+      String,
+      Boolean,
+      Array,
+      Object,
+      WeakSet,
+      Map,
+      Set,
+      Element: class Element {},
+      performance: { now: () => Date.now() },
+      setTimeout,
+      clearTimeout,
+      setInterval: () => 1,
+      clearInterval: () => {},
+      document: doc,
+      window: null,
+    };
+    sandbox.window = {
+      location: { protocol: 'https:', origin: `https://127.0.0.1:${port}` },
+      innerWidth: 1280,
+      innerHeight: 800,
+      localStorage: {
+        getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
+        setItem: (k, v) => storageMap.set(k, String(v)),
+      },
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    sandbox.window.top = sandbox.window;
+
+    const ctx = {
+      config: { enabled: true },
+      modules: { metrics: false, quotaBar: true, tokenAnalytics: true },
+      onCleanup: (fn) => cleanups.push(fn),
+    };
+    const compiled = vm.runInNewContext(`(function(ctx, boot) {\n${src}\n})`, sandbox);
+    compiled(ctx, ctx);
+    return { window: sandbox.window, cleanup: () => cleanups.forEach((fn) => fn()) };
+  }
+
+  // Session 1 on port 55047: user checks "also show 5h countdown" and selects compact style
+  const port1Storage = new Map();
+  const s1 = bootOnPort(55047, port1Storage);
+  s1.window.__ag_set_quota_prefs_fn({ style: 'compact', reset5h: true }, true);
+  assert.equal(s1.window.__ag_quota_bar_reset_5h, true);
+  assert.equal(s1.window.__ag_quota_bar_style, 'compact');
+  assert.ok(writtenCookies.some((c) => /ag_qb_prefs=compact\|popover\|1\|\d+/.test(c)));
+  assert.ok(writtenCookies.some((c) => c.includes('Path=/') && c.includes('Max-Age=31536000') && c.includes('SameSite=Lax') && c.includes('Secure')));
+  s1.cleanup();
+
+  // Session 2 after APP restart on fresh port 61234 with empty localStorage but shared cookie jar
+  const port2Storage = new Map();
+  const s2 = bootOnPort(61234, port2Storage);
+  assert.equal(s2.window.__ag_quota_bar_reset_5h, true, 'reset5h must survive port change via cookie');
+  assert.equal(s2.window.__ag_quota_bar_style, 'compact', 'style must survive port change via cookie');
+  const hydrated = JSON.parse(port2Storage.get('ag-quota-bar-prefs-v1') || '{}');
+  assert.equal(hydrated.reset5h, true);
+  assert.equal(hydrated.style, 'compact');
+  s2.cleanup();
 });

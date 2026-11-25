@@ -7,7 +7,7 @@
  * - Top titlebar independent pool pill (#ag-titlebar-quota-pill) when using Claude / GPT / Argon.
  * - Clickable / hoverable detail popover (#ag-quota-tooltip) with active pool highlight.
  * - Configurable in Settings -> Appearance (Style: Bar/Ring, Click: Details/Refresh/Settings,
- *   5h countdown co-display), persisted in localStorage & synced across windows.
+ *   5h countdown co-display), persisted via cookie + localStorage dual-write & synced across windows.
  * - Zero core/daemon.mjs edits, zero MutationObserver, full cleanup via ctx.onCleanup.
  * - Optional extension hooks via window.__agQuotaBarHooks.
  */
@@ -26,6 +26,8 @@
 
   const STORAGE_KEY = 'ag-quota-cache-v1';
   const PREFS_STORAGE_KEY = 'ag-quota-bar-prefs-v1';
+  const PREFS_COOKIE_KEY = 'ag_qb_prefs';
+  const PREFS_COOKIE_MAX_AGE_SEC = 31536000;
   const SIDEBAR_WRAP_ID = 'ag-sidebar-quota-wrap';
   const SIDEBAR_BTN_ID = 'ag-sidebar-quota-btn';
   const PILL_ID = 'ag-titlebar-quota-pill';
@@ -482,6 +484,124 @@
     }
     return { mode: 'empty', outerPct: null, innerPct: null, segments: [] };
   }
+
+  function encodePrefsCookieValue(prefsObj, updatedAtSec = 0) {
+    const style = normalizeQuotaBarStyleValue(prefsObj?.style);
+    const click = normalizeQuotaBarClickValue(prefsObj?.click);
+    const reset5h = normalizeQuotaBarReset5hValue(prefsObj?.reset5h) ? '1' : '0';
+    const rawTs = Number(updatedAtSec);
+    const ts = Number.isFinite(rawTs) && rawTs > 0 ? Math.floor(rawTs) : 0;
+    return ts > 0 ? `${style}|${click}|${reset5h}|${ts}` : `${style}|${click}|${reset5h}`;
+  }
+
+  function parsePrefsCookieString(cookieStr, key = 'ag_qb_prefs') {
+    const src = String(cookieStr || '');
+    if (!src) return null;
+    const partsList = src.split(';');
+    let rawVal = null;
+    for (let i = 0; i < partsList.length; i++) {
+      const item = partsList[i].trim();
+      if (!item) continue;
+      const eq = item.indexOf('=');
+      if (eq <= 0) continue;
+      if (item.slice(0, eq).trim() === key) {
+        rawVal = item.slice(eq + 1).trim();
+        break;
+      }
+    }
+    if (rawVal === null || rawVal === '') return null;
+    let decoded = rawVal;
+    try {
+      decoded = decodeURIComponent(rawVal);
+    } catch (e) {}
+    const fields = decoded.split('|');
+    if (fields.length !== 3 && fields.length !== 4) return null;
+    if (!fields[0] || !fields[1] || (fields[2] !== '0' && fields[2] !== '1')) return null;
+    let updatedAt = 0;
+    if (fields.length === 4) {
+      if (!/^\d+$/.test(fields[3])) return null;
+      const n = Number(fields[3]);
+      updatedAt = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+    }
+    return {
+      style: normalizeQuotaBarStyleValue(fields[0]),
+      click: normalizeQuotaBarClickValue(fields[1]),
+      reset5h: fields[2] === '1',
+      updatedAt
+    };
+  }
+
+  function mergeStoredPrefs(localParsed, cookieParsed, defaults = {}) {
+    const def = {
+      style: normalizeQuotaBarStyleValue(defaults?.style),
+      click: normalizeQuotaBarClickValue(defaults?.click),
+      reset5h: normalizeQuotaBarReset5hValue(defaults?.reset5h)
+    };
+    const normalizeEntry = (entry) => {
+      if (!entry || typeof entry !== 'object') return null;
+      const rawTs = Number(entry.updatedAt);
+      return {
+        style: entry.style !== undefined ? normalizeQuotaBarStyleValue(entry.style) : def.style,
+        click: entry.click !== undefined ? normalizeQuotaBarClickValue(entry.click) : def.click,
+        reset5h: entry.reset5h !== undefined ? normalizeQuotaBarReset5hValue(entry.reset5h) : def.reset5h,
+        updatedAt: Number.isFinite(rawTs) && rawTs > 0 ? Math.floor(rawTs) : 0
+      };
+    };
+
+    const localEntry = normalizeEntry(localParsed);
+    const cookieEntry = normalizeEntry(cookieParsed);
+
+    if (localEntry && cookieEntry) {
+      if (cookieEntry.updatedAt > localEntry.updatedAt) {
+        return {
+          prefs: { style: cookieEntry.style, click: cookieEntry.click, reset5h: cookieEntry.reset5h },
+          source: 'cookie',
+          updatedAt: cookieEntry.updatedAt,
+          needsLocalBackfill: true,
+          needsCookieBackfill: false
+        };
+      }
+      const sameVals =
+        localEntry.style === cookieEntry.style &&
+        localEntry.click === cookieEntry.click &&
+        localEntry.reset5h === cookieEntry.reset5h;
+      return {
+        prefs: { style: localEntry.style, click: localEntry.click, reset5h: localEntry.reset5h },
+        source: 'local',
+        updatedAt: Math.max(localEntry.updatedAt, cookieEntry.updatedAt),
+        needsLocalBackfill: false,
+        needsCookieBackfill: !sameVals || localEntry.updatedAt > cookieEntry.updatedAt
+      };
+    }
+
+    if (localEntry) {
+      return {
+        prefs: { style: localEntry.style, click: localEntry.click, reset5h: localEntry.reset5h },
+        source: 'local',
+        updatedAt: localEntry.updatedAt,
+        needsLocalBackfill: false,
+        needsCookieBackfill: true
+      };
+    }
+
+    if (cookieEntry) {
+      return {
+        prefs: { style: cookieEntry.style, click: cookieEntry.click, reset5h: cookieEntry.reset5h },
+        source: 'cookie',
+        updatedAt: cookieEntry.updatedAt,
+        needsLocalBackfill: true,
+        needsCookieBackfill: false
+      };
+    }
+
+    return {
+      prefs: def,
+      source: 'default',
+      updatedAt: 0,
+      needsLocalBackfill: false,
+      needsCookieBackfill: false
+    };
+  }
   /* QUOTA_BAR_LOGIC_END */
 
   const SETTINGS_UI_STRINGS = {
@@ -567,6 +687,50 @@
     return SETTINGS_UI_STRINGS[lang] || SETTINGS_UI_STRINGS.en;
   }
 
+  function readPrefsFromLocalStorage() {
+    try {
+      const raw = window.localStorage.getItem(PREFS_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function readPrefsFromCookie() {
+    try {
+      if (typeof document === 'undefined' || typeof document.cookie !== 'string') return null;
+      return parsePrefsCookieString(document.cookie, PREFS_COOKIE_KEY);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function writePrefsToLocalStorage(nextPrefs, updatedAt = 0) {
+    try {
+      window.localStorage.setItem(
+        PREFS_STORAGE_KEY,
+        JSON.stringify({
+          style: normalizeQuotaBarStyleValue(nextPrefs.style),
+          click: normalizeQuotaBarClickValue(nextPrefs.click),
+          reset5h: normalizeQuotaBarReset5hValue(nextPrefs.reset5h),
+          updatedAt: updatedAt > 0 ? updatedAt : Math.floor(Date.now() / 1000)
+        })
+      );
+    } catch (e) {}
+  }
+
+  function writePrefsToCookie(nextPrefs, updatedAt = 0) {
+    try {
+      if (typeof document === 'undefined' || typeof document.cookie !== 'string') return;
+      const val = encodePrefsCookieValue(nextPrefs, updatedAt);
+      const isHttps = typeof window !== 'undefined' && window.location?.protocol === 'https:';
+      const secureAttr = isHttps ? '; Secure' : '';
+      document.cookie = `${PREFS_COOKIE_KEY}=${val}; Path=/; Max-Age=${PREFS_COOKIE_MAX_AGE_SEC}; SameSite=Lax${secureAttr}`;
+    } catch (e) {}
+  }
+
   function readPrefsFromStorage() {
     const cfg = ctx?.config || {};
     const defaults = {
@@ -574,32 +738,25 @@
       click: normalizeQuotaBarClickValue(cfg.quotaBarClick ?? window.__ag_quota_bar_click),
       reset5h: normalizeQuotaBarReset5hValue(cfg.quotaBarReset5h ?? window.__ag_quota_bar_reset_5h)
     };
-    try {
-      const raw = window.localStorage.getItem(PREFS_STORAGE_KEY);
-      if (!raw) return defaults;
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== 'object') return defaults;
-      return {
-        style: parsed.style !== undefined ? normalizeQuotaBarStyleValue(parsed.style) : defaults.style,
-        click: parsed.click !== undefined ? normalizeQuotaBarClickValue(parsed.click) : defaults.click,
-        reset5h: parsed.reset5h !== undefined ? normalizeQuotaBarReset5hValue(parsed.reset5h) : defaults.reset5h
-      };
-    } catch (e) {
-      return defaults;
+    const merged = mergeStoredPrefs(readPrefsFromLocalStorage(), readPrefsFromCookie(), defaults);
+    const backfillTs = merged.updatedAt > 0 ? merged.updatedAt : Math.floor(Date.now() / 1000);
+    if (merged.needsCookieBackfill) {
+      writePrefsToCookie(merged.prefs, backfillTs);
     }
+    if (merged.needsLocalBackfill) {
+      writePrefsToLocalStorage(merged.prefs, backfillTs);
+    }
+    return merged.prefs;
   }
 
-  function writePrefsToStorage(nextPrefs) {
-    try {
-      window.localStorage.setItem(
-        PREFS_STORAGE_KEY,
-        JSON.stringify({
-          style: normalizeQuotaBarStyleValue(nextPrefs.style),
-          click: normalizeQuotaBarClickValue(nextPrefs.click),
-          reset5h: normalizeQuotaBarReset5hValue(nextPrefs.reset5h)
-        })
-      );
-    } catch (e) {}
+  function writePrefsToStorage(nextPrefs, updatedAt = Math.floor(Date.now() / 1000)) {
+    const normalized = {
+      style: normalizeQuotaBarStyleValue(nextPrefs.style),
+      click: normalizeQuotaBarClickValue(nextPrefs.click),
+      reset5h: normalizeQuotaBarReset5hValue(nextPrefs.reset5h)
+    };
+    writePrefsToLocalStorage(normalized, updatedAt);
+    writePrefsToCookie(normalized, updatedAt);
   }
 
   let prefs = readPrefsFromStorage();
