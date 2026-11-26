@@ -123,11 +123,14 @@ export function getPluginStatus({ targetDir = DEFAULT_TARGET_DIR } = {}) {
 
 export function installPlugin({ targetDir = DEFAULT_TARGET_DIR, pluginDir = PLUGIN_DIR } = {}) {
   const srcJsPath = join(pluginDir, 'quota-bar.js');
+  const srcRemoteJsPath = join(pluginDir, 'remote-metrics.js');
   const srcCssPath = join(pluginDir, 'quota-bar.css');
   if (!existsSync(srcJsPath) || !existsSync(srcCssPath)) {
     throw new Error(`Plugin source files missing in ${pluginDir}`);
   }
-  const srcJs = readFileSync(srcJsPath, 'utf8');
+  const srcQuotaJs = readFileSync(srcJsPath, 'utf8').trim();
+  const srcRemoteJs = existsSync(srcRemoteJsPath) ? readFileSync(srcRemoteJsPath, 'utf8').trim() : '';
+  const srcJs = srcRemoteJs ? `${srcQuotaJs}\n\n${srcRemoteJs}` : srcQuotaJs;
   const srcCss = readFileSync(srcCssPath, 'utf8');
 
   const dstJsPath = join(targetDir, 'custom.js');

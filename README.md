@@ -39,6 +39,12 @@
   - **配额点击**：`详情卡` / `刷新` / `设置`（后两者支持悬停预览详情）
   - **同时展示 5h 倒计时**：开关（Cookie + `localStorage` 双写，跨重启换端口持久化与多窗口实时同步）
 
+### 2. 远程 SSH 会话指标胶囊与轮次浮窗回退（`remote-metrics`）
+
+- **零本地侵入的纯回退机制**：针对 Remote SSH 等远端主机窗口（会话 `.db` 位于远端主机而非本机），仅在 `chuanban` 守护进程返回 `dbFound: false` 时自动激活；本地窗口完全不扫描 React Fiber、不启动轮询，零额外开销。
+- **复用原版胶囊与轮次浮窗 UI**：通过只读调用页内 `authService._lsClient` 的 `getCascadeTrajectoryGeneratorMetadata` 与 `getCascadeTrajectorySteps`（增量拉取并处理 Protobuf `BigInt` 字段），按与原版一致的口吻与格式输出至 `window.__ag_render_metrics`，自动兼容 `compact` / `full` 模式与中英文切换。
+- **防闪烁与生命周期隔离**：缓存已拉取的远端指标以防止守护进程周期性重同步清空胶囊；`0 MutationObserver`，完整接入 `ctx.onCleanup` 热重载清理。
+
 ---
 
 ## 环境要求
@@ -74,7 +80,7 @@ node install.mjs uninstall
 ### 方式二：手动安装
 
 1. 将 [quota-bar.css](./quota-bar.css) 的内容追加到 `~/.gemini/antigravity/theme-patch/user/custom.css`；
-2. 将 [quota-bar.js](./quota-bar.js) 的内容追加到 `~/.gemini/antigravity/theme-patch/user/custom.js`；
+2. 将 [quota-bar.js](./quota-bar.js) 与 [remote-metrics.js](./remote-metrics.js) 的内容追加到 `~/.gemini/antigravity/theme-patch/user/custom.js`；
 3. 确保 `~/.gemini/antigravity/theme-patch/user/config.json` 中 `enabled`、`modules.customCss`、`modules.customJs` 均为 `true`（默认即为 `true`）。
 
 ---
