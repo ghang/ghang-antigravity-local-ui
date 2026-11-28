@@ -34,6 +34,7 @@
   const TOOLTIP_ID = 'ag-quota-tooltip';
   const COMPACT_WIDTH_PX = 110;
   const POLL_INTERVAL_MS = 60000;
+  const ACCOUNT_META_TTL_MS = 5 * 60 * 1000;
   const STATE_WATCH_INTERVAL_MS = 1500;
   const COLD_BOOT_RETRY_MS = 1500;
   const MAX_COLD_BOOT_RETRIES = 8;
@@ -391,6 +392,57 @@
     else if (tierLabel.length > 18) tierLabel = tierLabel.slice(0, 18);
     if (!maskedEmail && !tierLabel) return null;
     return { maskedEmail, tierLabel };
+  }
+
+  function accountsDiffer(prevAcct, nextAcct) {
+    if (!prevAcct && !nextAcct) return false;
+    return (
+      String(prevAcct?.tierLabel || '') !== String(nextAcct?.tierLabel || '') ||
+      String(prevAcct?.maskedEmail || '') !== String(nextAcct?.maskedEmail || '')
+    );
+  }
+
+  function detectQuotaWindowResetOrJump(prevGroups, nextGroups) {
+    if (!Array.isArray(prevGroups) || prevGroups.length === 0 || !Array.isArray(nextGroups) || nextGroups.length === 0) {
+      return false;
+    }
+    const prevMap = new Map();
+    for (let gi = 0; gi < prevGroups.length; gi++) {
+      const g = prevGroups[gi];
+      const buckets = Array.isArray(g?.buckets) ? g.buckets : [];
+      for (let bi = 0; bi < buckets.length; bi++) {
+        const b = buckets[bi];
+        const key = b?.bucketId ? `id:${b.bucketId}` : `pos:${gi}:${String(b?.window || bi).toLowerCase()}`;
+        prevMap.set(key, b);
+      }
+    }
+    for (let gi = 0; gi < nextGroups.length; gi++) {
+      const g = nextGroups[gi];
+      const buckets = Array.isArray(g?.buckets) ? g.buckets : [];
+      for (let bi = 0; bi < buckets.length; bi++) {
+        const b = buckets[bi];
+        const key = b?.bucketId ? `id:${b.bucketId}` : `pos:${gi}:${String(b?.window || bi).toLowerCase()}`;
+        const prev = prevMap.get(key);
+        if (!prev) continue;
+        if (
+          typeof prev.resetSec === 'number' &&
+          prev.resetSec > 0 &&
+          typeof b.resetSec === 'number' &&
+          b.resetSec > 0 &&
+          b.resetSec !== prev.resetSec
+        ) {
+          return true;
+        }
+        if (
+          typeof prev.remainingFraction === 'number' &&
+          typeof b.remainingFraction === 'number' &&
+          b.remainingFraction > prev.remainingFraction + 0.05
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   function normalizeGroupsForCache(groups) {
@@ -788,7 +840,16 @@
   let cachedAccountMeta = null;
   let cachedRawAccountStatus = null;
   let accountMetaResolved = false;
+  let accountMetaResolvedAtMs = 0;
   let initialHookSynced = false;
+
+  function invalidateAccountMetaCache() {
+    cachedFiberUserStatus = null;
+    cachedAccountMeta = null;
+    cachedRawAccountStatus = null;
+    accountMetaResolved = false;
+    accountMetaResolvedAtMs = 0;
+  }
   let authSubDisposable = null;
   let lastFetchMs = 0;
   let isFetching = false;
@@ -1092,10 +1153,7 @@
       if (typeof eventFn === 'function') {
         authSubDisposable = eventFn(() => {
           if (!disposed) {
-            cachedFiberUserStatus = null;
-            cachedAccountMeta = null;
-            cachedRawAccountStatus = null;
-            accountMetaResolved = false;
+            invalidateAccountMetaCache();
             cachedServices = null;
             fiberAuthScanDone = false;
             void fetchQuota(true);
@@ -1106,7 +1164,12 @@
   }
 
   async function resolveAccountMetadata(authService, force = false) {
-    if (!force && accountMetaResolved && cachedAccountMeta) {
+    if (
+      !force &&
+      accountMetaResolved && cachedAccountMeta &&
+      accountMetaResolvedAtMs > 0 &&
+      Date.now() - accountMetaResolvedAtMs < ACCOUNT_META_TTL_MS
+    ) {
       return cachedAccountMeta;
     }
 
@@ -1118,6 +1181,7 @@
       cachedRawAccountStatus = src;
       cachedAccountMeta = norm;
       accountMetaResolved = true;
+      accountMetaResolvedAtMs = Date.now();
       return norm;
     };
 
@@ -1178,6 +1242,10 @@
     if (!fresh) return false;
     const freshMs = fresh.updatedAtSec ? fresh.updatedAtSec * 1000 : 0;
     if (fresh.updatedAtSec > quotaState.updatedAtSec) {
+      const accountChanged = accountsDiffer(quotaState.account, fresh.account);
+      if (accountChanged) {
+        invalidateAccountMetaCache();
+      }
       quotaState = fresh;
       hasError = false;
       if (freshMs > lastFetchMs) {
@@ -1205,10 +1273,7 @@
         if (!hasExpired) return;
       }
     } else {
-      cachedFiberUserStatus = null;
-      cachedAccountMeta = null;
-      cachedRawAccountStatus = null;
-      accountMetaResolved = false;
+      invalidateAccountMetaCache();
     }
 
     const services = findFrontendServices();
@@ -1221,13 +1286,17 @@
     renderAll();
     try {
       const summary = await services.cloudCodeService.retrieveUserQuotaSummary(Boolean(force));
-      const account = await resolveAccountMetadata(services.authService, Boolean(force));
       const rawGroups = Array.isArray(summary?.response?.groups)
         ? summary.response.groups
         : Array.isArray(summary?.groups)
           ? summary.groups
           : [];
       const normalizedGroups = normalizeGroupsForCache(rawGroups);
+      const windowResetOrJumped = detectQuotaWindowResetOrJump(quotaState.groups, normalizedGroups);
+      if (windowResetOrJumped) {
+        invalidateAccountMetaCache();
+      }
+      const account = await resolveAccountMetadata(services.authService, Boolean(force) || windowResetOrJumped);
       if (normalizedGroups.length > 0) {
         quotaState = {
           updatedAtSec: Math.floor(Date.now() / 1000),
@@ -2728,12 +2797,29 @@
     if (ev.key !== STORAGE_KEY || !ev.newValue) return;
     const nextCached = readCacheFromStorage();
     if (nextCached && nextCached.updatedAtSec >= quotaState.updatedAtSec) {
+      const accountChanged = accountsDiffer(quotaState.account, nextCached.account);
+      if (accountChanged) {
+        invalidateAccountMetaCache();
+      }
       quotaState = nextCached;
       const syncedAtMs = nextCached.updatedAtSec ? nextCached.updatedAtSec * 1000 : Date.now();
       lastFetchMs = Math.max(lastFetchMs, syncedAtMs);
       hasError = false;
       renderAll();
-      notifyQuotaUpdatedHook(null);
+      if (accountChanged) {
+        void (async () => {
+          const svcs = findFrontendServices();
+          if (svcs?.authService) {
+            await resolveAccountMetadata(svcs.authService, true);
+          }
+          if (!disposed) {
+            renderAll();
+            notifyQuotaUpdatedHook(null);
+          }
+        })();
+      } else {
+        notifyQuotaUpdatedHook(null);
+      }
     }
   }
 

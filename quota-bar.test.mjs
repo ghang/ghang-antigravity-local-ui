@@ -44,6 +44,8 @@ function loadLogicHelpers() {
       formatSidebarResetStatus,
       maskEmail,
       normalizeAccountInfo,
+      accountsDiffer,
+      detectQuotaWindowResetOrJump,
       normalizeGroupsForCache,
       detectTurnFinishedSignal,
       resolveCompactRingModel,
@@ -1046,4 +1048,199 @@ test('prefs dual-write persistence: cookie helpers and cross-port restart recove
   assert.equal(hydrated.reset5h, true);
   assert.equal(hydrated.style, 'compact');
   s2.cleanup();
+});
+
+test('in-place tier upgrade detection: detectQuotaWindowResetOrJump, accountsDiffer, TTL expiry, and fetchQuota(false) tier refresh', async () => {
+  const h = loadLogicHelpers();
+  assert.equal(h.accountsDiffer({ maskedEmail: 'a@b.com', tierLabel: 'Pro' }, { maskedEmail: 'a@b.com', tierLabel: 'Ultra' }), true);
+  assert.equal(h.accountsDiffer({ maskedEmail: 'a@b.com', tierLabel: 'Pro' }, { maskedEmail: 'a@b.com', tierLabel: 'Pro' }), false);
+
+  const gPrev = [{ displayName: 'Gemini Models', buckets: [{ bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.1, resetSec: 1796291118 }] }];
+  const gSame = [{ displayName: 'Gemini Models', buckets: [{ bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.09, resetSec: 1796291118 }] }];
+  const gReset = [{ displayName: 'Gemini Models', buckets: [{ bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.99, resetSec: 1796470558 }] }];
+  const gJumped = [{ displayName: 'Gemini Models', buckets: [{ bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.99, resetSec: 1796291118 }] }];
+  assert.equal(h.detectQuotaWindowResetOrJump(gPrev, gSame), false);
+  assert.equal(h.detectQuotaWindowResetOrJump(gPrev, gReset), true);
+  assert.equal(h.detectQuotaWindowResetOrJump(gPrev, gJumped), true);
+
+  const src = readFileSync(JS_PATH, 'utf8');
+  let curTier = { id: 'g1-pro-tier', name: 'Google AI Pro' };
+  let curResetSec = 1796291118;
+  let curRem = 0.12;
+  let userStatusCalls = 0;
+  let fakeNowMs = 1795860000000;
+  const hookEvents = [];
+  const intervals = [];
+  const storageMap = new Map();
+
+  const mockCloudCodeService = {
+    async retrieveUserQuotaSummary() {
+      return {
+        response: {
+          groups: [
+            {
+              displayName: 'Gemini Models',
+              buckets: [
+                {
+                  bucketId: 'gemini-weekly',
+                  window: 'weekly',
+                  remaining: { case: 'remainingFraction', value: curRem },
+                  resetTime: { seconds: String(curResetSec) },
+                },
+              ],
+            },
+          ],
+        },
+      };
+    },
+  };
+  const mockAuthService = {
+    _lsClient: {
+      async getUserStatus() {
+        userStatusCalls += 1;
+        return { userStatus: { email: 'upgrade@example.com', userTier: curTier } };
+      },
+    },
+  };
+
+  const makeEl = (tag = 'div') => ({
+    tagName: tag.toUpperCase(),
+    nodeType: 1,
+    style: {},
+    attrs: new Map(),
+    children: [],
+    className: '',
+    textContent: '',
+    setAttribute(k, v) { this.attrs.set(k, String(v)); },
+    getAttribute(k) { return this.attrs.has(k) ? this.attrs.get(k) : null; },
+    hasAttribute(k) { return this.attrs.has(k); },
+    removeAttribute(k) { this.attrs.delete(k); },
+    appendChild(c) { c.parentElement = this; this.children.push(c); return c; },
+    insertBefore(c) { c.parentElement = this; this.children.push(c); return c; },
+    replaceChildren() { this.children = []; },
+    addEventListener() {},
+    removeEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    closest() { return null; },
+    getBoundingClientRect() { return { width: 200, height: 30, left: 0, top: 0, right: 200, bottom: 30 }; },
+    remove() {},
+  });
+
+  const rootEl = makeEl('div');
+  rootEl.id = 'root';
+  rootEl['__reactContainer$test'] = {
+    current: {
+      memoizedProps: { value: { core: { cloudCodeService: mockCloudCodeService, authService: mockAuthService } } },
+    },
+  };
+
+  class FakeDate extends Date {
+    constructor(...args) {
+      super(...(args.length === 0 ? [fakeNowMs] : args));
+    }
+    static now() {
+      return fakeNowMs;
+    }
+  }
+
+  const sandbox = {
+    console,
+    Date: FakeDate,
+    Math,
+    JSON,
+    Number,
+    String,
+    Boolean,
+    Array,
+    Object,
+    WeakSet,
+    Map,
+    Set,
+    Element: class Element {},
+    performance: { now: () => fakeNowMs },
+    setTimeout,
+    clearTimeout,
+    setInterval(fn, ms) {
+      const id = intervals.length + 1;
+      intervals.push({ id, fn, ms });
+      return id;
+    },
+    clearInterval() {},
+    document: {
+      hidden: false,
+      visibilityState: 'visible',
+      documentElement: makeEl('html'),
+      body: makeEl('body'),
+      getElementById: (id) => (id === 'root' ? rootEl : null),
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      createElement: makeEl,
+      createElementNS: (_ns, tag) => makeEl(tag),
+      addEventListener() {},
+      removeEventListener() {},
+    },
+    window: null,
+  };
+  sandbox.window = {
+    location: { protocol: 'vscode-file:' },
+    innerWidth: 1280,
+    innerHeight: 800,
+    localStorage: {
+      getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
+      setItem: (k, v) => storageMap.set(k, String(v)),
+    },
+    __agQuotaBarHooks: {
+      onQuotaUpdated(ev) {
+        hookEvents.push(ev);
+      },
+    },
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  sandbox.window.top = sandbox.window;
+
+  const cleanups = [];
+  const ctx = {
+    config: { enabled: true },
+    modules: { metrics: false, quotaBar: true, tokenAnalytics: true },
+    onCleanup: (fn) => cleanups.push(fn),
+  };
+  vm.runInNewContext(`(function(ctx, boot) {\n${src}\n})`, sandbox)(ctx, ctx);
+
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(userStatusCalls, 1);
+  assert.equal(hookEvents.at(-1)?.account?.tierLabel, 'Pro');
+
+  const poll60s = intervals.find((i) => i.ms === 60000);
+  assert.ok(poll60s);
+
+  // 1) Normal poll within TTL and same reset window -> caches userStatus
+  fakeNowMs += 65000;
+  curRem = 0.11;
+  poll60s.fn();
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(userStatusCalls, 1, 'should reuse cached account metadata within TTL when window unchanged');
+
+  // 2) Account upgraded Pro -> Ultra in-place, resetSec changes -> immediately re-queries getUserStatus even within TTL!
+  fakeNowMs += 65000;
+  curTier = { id: 'g1-ultra-lite-tier', name: 'Google AI Ultra' };
+  curResetSec = 1796470558;
+  curRem = 0.99;
+  poll60s.fn();
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(userStatusCalls, 2, 'window reset/jump must bypass metadata cache and detect Ultra');
+  assert.equal(hookEvents.at(-1)?.account?.tierLabel, 'Ultra');
+  assert.equal(hookEvents.at(-1)?.rawAccountStatus?.userTier?.id, 'g1-ultra-lite-tier');
+  const cached = JSON.parse(storageMap.get('ag-quota-cache-v1') || '{}');
+  assert.equal(cached.account?.tierLabel, 'Ultra');
+
+  // 3) TTL expires (5 min) without window reset -> refreshes metadata anyway
+  fakeNowMs += 5 * 60 * 1000 + 5000;
+  curRem = 0.98;
+  poll60s.fn();
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(userStatusCalls, 3, 'TTL expiry must re-query getUserStatus');
+
+  for (const c of cleanups) c();
 });
